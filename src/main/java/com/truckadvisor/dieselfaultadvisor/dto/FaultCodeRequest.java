@@ -19,6 +19,8 @@ public class FaultCodeRequest {
     
     @NotBlank(message = "FMI (Failure Mode Identifier) is required")
     private String fmi;
+    
+    private String language; // Optional: "en" or "es" for response language
 }
 
 // Made with Bob

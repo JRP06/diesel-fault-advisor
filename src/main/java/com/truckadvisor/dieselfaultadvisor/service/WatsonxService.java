@@ -30,6 +30,7 @@ public class WatsonxService {
     
     private final WatsonxConfig config;
     private final IamTokenService iamTokenService;
+    private final FaultCodeDatasetService faultCodeDatasetService;
     private final RestTemplate restTemplate = new RestTemplate();
     private final ObjectMapper objectMapper = new ObjectMapper();
     
@@ -40,12 +41,12 @@ public class WatsonxService {
      * @param fmi Failure Mode Identifier
      * @return Comprehensive fault code analysis
      */
-    public FaultCodeAnalysis analyzeFaultCode(String spn, String fmi) {
-        log.info("=== Starting fault code analysis: SPN {} FMI {} ===", spn, fmi);
+    public FaultCodeAnalysis analyzeFaultCode(String spn, String fmi, String language) {
+        log.info("=== Starting fault code analysis: SPN {} FMI {} Language {} ===", spn, fmi, language);
         
         try {
             // Build the prompt for the AI model
-            String prompt = buildPrompt(spn, fmi);
+            String prompt = buildPrompt(spn, fmi, language);
             log.debug("Built prompt with {} characters", prompt.length());
             
             // Create API request
@@ -68,34 +69,220 @@ public class WatsonxService {
     }
     
     /**
+     * Answer a follow-up question about a fault code
+     *
+     * @param spn Suspect Parameter Number
+     * @param fmi Failure Mode Identifier
+     * @param question The follow-up question
+     * @param language Language preference
+     * @return Answer to the follow-up question
+     */
+    public String answerFollowUpQuestion(String spn, String fmi, String question, String language) {
+        log.info("=== Answering follow-up question for SPN {} FMI {} ===", spn, fmi);
+        log.debug("Question: {}", question);
+        
+        try {
+            // Build a prompt for the follow-up question
+            String prompt = buildFollowUpPrompt(spn, fmi, question, language);
+            
+            // Create API request
+            WatsonxApiRequest request = buildApiRequest(prompt);
+            
+            // Call watsonx.ai API
+            WatsonxApiResponse response = callWatsonxApi(request);
+            
+            // Extract the answer
+            if (response.getResults() != null && !response.getResults().isEmpty()) {
+                String answer = response.getResults().get(0).getGeneratedText();
+                log.info("=== Successfully answered follow-up question ===");
+                return answer.trim();
+            } else {
+                throw new WatsonxApiException("No answer generated for follow-up question");
+            }
+            
+        } catch (Exception e) {
+            log.error("=== FAILED to answer follow-up question ===", e);
+            throw e;
+        }
+    }
+    
+    /**
+     * Answer a general truck question (chat assistant)
+     *
+     * @param question The user's question in plain language
+     * @param language Language preference
+     * @return Answer to the question
+     */
+    public String answerChatQuestion(String question, String language) {
+        log.info("=== Answering chat question ===");
+        log.debug("Question: {}", question);
+        
+        try {
+            // Build a prompt for the chat question
+            String prompt = buildChatPrompt(question, language);
+            
+            // Create API request
+            WatsonxApiRequest request = buildApiRequest(prompt);
+            
+            // Call watsonx.ai API
+            WatsonxApiResponse response = callWatsonxApi(request);
+            
+            // Extract the answer
+            if (response.getResults() != null && !response.getResults().isEmpty()) {
+                String answer = response.getResults().get(0).getGeneratedText();
+                // Clean up the response: remove trailing numbers and formatting artifacts
+                answer = cleanResponse(answer);
+                log.info("=== Successfully answered chat question ===");
+                return answer.trim();
+            } else {
+                throw new WatsonxApiException("No answer generated for chat question");
+            }
+            
+        } catch (Exception e) {
+            log.error("=== FAILED to answer chat question ===", e);
+            throw e;
+        }
+    }
+    
+    /**
+     * Clean up AI response by removing trailing numbers and formatting artifacts
+     */
+    private String cleanResponse(String text) {
+        if (text == null) return "";
+        
+        // Remove trailing numbers at end of sentences (e.g., "sentence.3" or "sentence. 5")
+        text = text.replaceAll("\\.\\s*\\d+\\s*$", ".");
+        text = text.replaceAll("\\.\\s*\\d+\\s*\\.", ".");
+        
+        // Remove standalone numbers at the end
+        text = text.replaceAll("\\s+\\d+\\s*$", "");
+        
+        // Remove multiple spaces
+        text = text.replaceAll("\\s+", " ");
+        
+        return text.trim();
+    }
+
+    /**
+     * Build a prompt for chat questions with strict guardrails
+     */
+    private String buildChatPrompt(String question, String language) {
+        boolean isSpanish = "es".equalsIgnoreCase(language);
+        
+        if (isSpanish) {
+            return String.format("""
+                INSTRUCCIÓN ABSOLUTA: Eres un asistente SOLO para problemas mecánicos de camiones diesel.
+                
+                Si la pregunta NO es sobre motores diesel o mecánica de camiones, responde ÚNICAMENTE: "Solo puedo ayudar con problemas mecánicos de camiones diesel y códigos de falla." No agregues nada más.
+                
+                Si SÍ es sobre mecánica diesel, responde en máximo 3 oraciones simples.
+                
+                Pregunta: %s
+                Respuesta:
+                """, question);
+        } else {
+            return String.format("""
+                ABSOLUTE INSTRUCTION: You are an assistant ONLY for diesel truck mechanical problems.
+                
+                If the question is NOT about diesel engines or truck mechanics, respond ONLY: "I can only help with diesel truck mechanical issues and fault codes." Add nothing else.
+                
+                If YES about diesel mechanics, answer in maximum 3 simple sentences.
+                
+                Question: %s
+                Answer:
+                """, question);
+        }
+    }
+    
+    
+    
+    /**
+     * Build a prompt for follow-up questions
+     */
+    private String buildFollowUpPrompt(String spn, String fmi, String question, String language) {
+        boolean isSpanish = "es".equalsIgnoreCase(language);
+        
+        if (isSpanish) {
+            return String.format("""
+                Eres un experto mecánico de camiones diesel respondiendo una pregunta de seguimiento sobre el código de falla SPN %s FMI %s.
+                
+                IMPORTANTE: Responde COMPLETAMENTE EN ESPAÑOL. Usa palabras simples y cotidianas.
+                
+                Pregunta del usuario: %s
+                
+                Proporciona una respuesta clara y detallada. Explica CADA término técnico entre paréntesis. Menciona ubicaciones físicas cuando sea relevante. El usuario NO es mecánico.
+                """, spn, fmi, question);
+        } else {
+            return String.format("""
+                You are an expert diesel truck mechanic answering a follow-up question about fault code SPN %s FMI %s.
+                
+                IMPORTANT: Use simple, everyday language. The user is NOT a mechanic.
+                
+                User's question: %s
+                
+                Provide a clear and detailed answer. Explain EVERY technical term in parentheses. Mention physical locations when relevant. Be helpful and thorough.
+                """, spn, fmi, question);
+        }
+    }
+    
+    /**
      * Build a specialized prompt for diesel truck fault code analysis
      */
-    private String buildPrompt(String spn, String fmi) {
-        return String.format("""
-            You are an expert diesel truck mechanic and diagnostic specialist. Analyze the following fault code:
-            
-            Fault Code: SPN %s FMI %s
-            
-            Provide a comprehensive analysis in the following format:
-            
-            EXPLANATION:
-            [Provide a clear, plain English explanation of what this fault code means]
-            
-            ROOT CAUSES:
-            - [List 3-5 common root causes, one per line]
-            
-            FIX INSTRUCTIONS:
-            1. [Step-by-step diagnostic and repair instructions]
-            2. [Continue numbering each step]
-            
-            TOOLS NEEDED:
-            - [List all tools required]
-            
-            PARTS TO BUY:
-            - [List parts that may need replacement with OEM recommendations]
-            
-            Be specific, technical, and practical. Focus on actionable information for a mechanic.
-            """, spn, fmi);
+    private String buildPrompt(String spn, String fmi, String language) {
+        boolean isSpanish = "es".equalsIgnoreCase(language);
+        
+        // Get Detroit Series 60 specific context
+        String faultCodeContext = faultCodeDatasetService.getFaultCodeContext(spn, fmi);
+        
+        if (isSpanish) {
+            return String.format("""
+                Eres mecánico Detroit Series 60 DDEC. Código: SPN %s FMI %s
+                
+                CONTEXTO: %s
+                
+                IMPORTANTE: Responde EN ESPAÑOL. Máximo 3-4 oraciones por sección. Palabras simples. Directo al punto.
+                
+                EXPLICACIÓN:
+                [2-3 oraciones. Qué significa. Explica términos técnicos entre paréntesis.]
+                
+                CAUSAS COMUNES:
+                - [3-4 causas. Menciona ubicación física.]
+                
+                INSTRUCCIONES DE REPARACIÓN:
+                1. [Pasos cortos y claros. Qué hacer.]
+                2. [Máximo 4-5 pasos.]
+                
+                HERRAMIENTAS NECESARIAS:
+                - [Lista simple de herramientas]
+                
+                PARTES A COMPRAR:
+                - [Nombre parte + ubicación + número OEM si posible]
+                """, spn, fmi, faultCodeContext);
+        } else {
+            return String.format("""
+                Detroit Series 60 DDEC mechanic. Code: SPN %s FMI %s
+                
+                CONTEXT: %s
+                
+                IMPORTANT: Simple words. Max 3-4 sentences per section. Straight to the point.
+                
+                EXPLANATION:
+                [2-3 sentences. What it means. Explain technical terms in parentheses.]
+                
+                ROOT CAUSES:
+                - [3-4 causes. Mention physical location.]
+                
+                FIX INSTRUCTIONS:
+                1. [Short clear steps. What to do.]
+                2. [Max 4-5 steps.]
+                
+                TOOLS NEEDED:
+                - [Simple tool list]
+                
+                PARTS TO BUY:
+                - [Part name + location + OEM number if possible]
+                """, spn, fmi, faultCodeContext);
+        }
     }
     
     /**
@@ -249,6 +436,7 @@ public class WatsonxService {
     
     /**
      * Parse the AI response and structure it into FaultCodeAnalysis
+     * Supports both English and Spanish section markers
      */
     private FaultCodeAnalysis parseResponse(String spn, String fmi, WatsonxApiResponse response) {
         log.info("Parsing watsonx.ai response...");
@@ -263,15 +451,33 @@ public class WatsonxService {
         log.debug("Full generated text:\n{}", generatedText);
         
         try {
-            FaultCodeAnalysis analysis = FaultCodeAnalysis.builder()
-                .faultCode(String.format("SPN %s FMI %s", spn, fmi))
-                .explanation(extractSection(generatedText, "EXPLANATION:", "ROOT CAUSES:"))
-                .rootCauses(extractList(generatedText, "ROOT CAUSES:", "FIX INSTRUCTIONS:"))
-                .fixInstructions(extractNumberedList(generatedText, "FIX INSTRUCTIONS:", "TOOLS NEEDED:"))
-                .toolsNeeded(extractList(generatedText, "TOOLS NEEDED:", "PARTS TO BUY:"))
-                .partsToBuy(extractList(generatedText, "PARTS TO BUY:", null))
-                .timestamp(Instant.now().toString())
-                .build();
+            // Detect language based on section markers
+            boolean isSpanish = generatedText.contains("EXPLICACIÓN:") || generatedText.contains("CAUSAS COMUNES:");
+            
+            FaultCodeAnalysis analysis;
+            if (isSpanish) {
+                log.info("Detected Spanish response, using Spanish section markers");
+                analysis = FaultCodeAnalysis.builder()
+                    .faultCode(String.format("SPN %s FMI %s", spn, fmi))
+                    .explanation(extractSection(generatedText, "EXPLICACIÓN:", "CAUSAS COMUNES:"))
+                    .rootCauses(extractList(generatedText, "CAUSAS COMUNES:", "INSTRUCCIONES DE REPARACIÓN:"))
+                    .fixInstructions(extractNumberedList(generatedText, "INSTRUCCIONES DE REPARACIÓN:", "HERRAMIENTAS NECESARIAS:"))
+                    .toolsNeeded(extractList(generatedText, "HERRAMIENTAS NECESARIAS:", "PARTES A COMPRAR:"))
+                    .partsToBuy(extractList(generatedText, "PARTES A COMPRAR:", null))
+                    .timestamp(Instant.now().toString())
+                    .build();
+            } else {
+                log.info("Detected English response, using English section markers");
+                analysis = FaultCodeAnalysis.builder()
+                    .faultCode(String.format("SPN %s FMI %s", spn, fmi))
+                    .explanation(extractSection(generatedText, "EXPLANATION:", "ROOT CAUSES:"))
+                    .rootCauses(extractList(generatedText, "ROOT CAUSES:", "FIX INSTRUCTIONS:"))
+                    .fixInstructions(extractNumberedList(generatedText, "FIX INSTRUCTIONS:", "TOOLS NEEDED:"))
+                    .toolsNeeded(extractList(generatedText, "TOOLS NEEDED:", "PARTS TO BUY:"))
+                    .partsToBuy(extractList(generatedText, "PARTS TO BUY:", null))
+                    .timestamp(Instant.now().toString())
+                    .build();
+            }
             
             log.info("Successfully parsed response into FaultCodeAnalysis");
             log.debug("Parsed sections - Explanation length: {}, Root causes: {}, Fix instructions: {}, Tools: {}, Parts: {}",
